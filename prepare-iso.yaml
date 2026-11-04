@@ -1,0 +1,161 @@
+---
+- name: "Prepare customized ISO"
+  hosts: localhost
+  vars:
+    base_iso: "/iso/debian-13.7.0-amd64-DVD-1.iso"
+
+  tasks:
+    - name: "Install additional packages"
+      become: true
+      ansible.builtin.package:
+        name:
+        - libarchive-tools # bsdtar
+        - xoriso
+
+    - name: "Create tmp directory"
+      ansible.builtin.tempfile:
+        state: directory
+      register: tmpdir
+
+    - name: "Unpack iso"
+      ansible.builtin.command:
+        cmd: "bsdtar -C {{ tmpdir.path }} -xf {{ base_iso }}"
+
+    - name: "Create custom directory"
+      ansible.builtin.file:
+        path: "{{ tmpdir.path }}/custom"
+        state: directory
+        mode: "0755"
+
+    # based on: https://www.debian.org/releases/trixie/example-preseed.txt
+    - name: "Create preseed.cfg"
+      ansible.builtin.copy:
+        dest: "{{ tmpdir.path }}/custom/preseed.cfg"
+        content: |
+          d-i netcfg/choose_interface select auto
+          d-i time/zone string Europe/Berlin
+          d-i netcfg/get_hostname string unassigned-hostname
+          d-i netcfg/get_domain string unassigned-domain
+          d-i passwd/make-user boolean false
+          d-i passwd/root-password password s3cr3t
+          d-i passwd/root-password-again password s3cr3t
+          # ...
+
+    - name: "Adjust legacy/BIOS/CSM boot menu"
+      block:
+        - name: "Make isolinux writeable"
+          ansible.builtin.file:
+            path: "{{ tmpdir.path }}/isolinux"
+            mode: 'a+w'
+
+        - name: "Create custom boot config"
+          ansible.builtin.copy:
+            dest: "{{ tmpdir.path }}/isolinux/custom.cfg"
+            content: |
+              default custom
+              label custom
+                menu label Custom Install
+                menu default
+                kernel /install.amd/vmlinuz
+                append vga=788 initrd=/install.amd/gtk/initrd.gz language=en country=DE locale=en_US.UTF-8 keymap=de net.ifnames=0 auto preseed/file=/cdrom/custom/preseed.cfg --- quiet
+            mode: "0644"
+
+        - name: "Include custom isolinux configuration"
+          ansible.builtin.lineinfile:
+            path: "{{ tmpdir.path }}/isolinux/isolinux.cfg"
+            line: "include custom.cfg"
+            insertbefore: '^include menu\.cfg$'
+            state: present
+
+        - name: "Remove original default menu entry"
+          ansible.builtin.lineinfile:
+            path: "{{ tmpdir.path }}/isolinux/gtk.cfg"
+            regexp: '^\tmenu default\s*$'
+            state: absent
+
+        - name: "Remove automatic start of speech synthesis"
+          ansible.builtin.replace:
+            path: "{{ tmpdir.path }}/isolinux/spkgtk.cfg"
+            regexp: '(?m)^timeout[^\r\n]*(?:\r?\n[^\r\n]*){3}\r?\n?'
+            replace: ""
+
+        - name: "Make isolinux unwriteable"
+          ansible.builtin.file:
+            path: "{{ tmpdir.path }}/isolinux"
+            mode: 'a-w'
+
+    - name: "Adjust EFI boot menu"
+      block:
+        - name: "Make grub.cfg writeable"
+          ansible.builtin.file:
+            path: "{{ tmpdir.path }}/boot/grub"
+            mode: 'a+w'
+
+        - name: "Adjust grub configuration"
+          ansible.builtin.blockinfile:
+            path: "{{ tmpdir.path }}/boot/grub/grub.cfg"
+            insertafter: '^set theme=/boot/grub/theme/1$'
+            marker: '# {mark} efi boot entry'
+            block: |
+              menuentry "Custom Install" {
+                  set background_color=black
+                  linux    /install.amd/vmlinuz vga=788 language=en country=DE locale=en_US.UTF-8 keymap=de net.ifnames=0 auto preseed/file=/cdrom/custom/preseed.cfg --- quiet
+                  initrd   /install.amd/gtk/initrd.gz
+              }
+
+        - name: "Make grub.cfg unwriteable"
+          ansible.builtin.file:
+            path: "{{ tmpdir.path }}/boot/grub"
+            mode: 'a-w'
+
+    - name: "Regenerate hashes"
+      block:
+        - name: "Make md5sum.txt writeable"
+          ansible.builtin.file:
+            path: "{{ tmpdir.path }}/md5sum.txt"
+            mode: 'a+w'
+
+        - name: "Regenerate hashes"
+          ansible.builtin.shell:
+            cmd: find -follow -type f ! -name md5sum.txt -print0 2> /dev/null | xargs -0 md5sum > md5sum.txt
+            chdir: "{{ tmpdir.path }}"
+
+        - name: "Make md5sum.txt unwriteable"
+          ansible.builtin.file:
+            path: "{{ tmpdir.path }}/md5sum.txt"
+            mode: 'a-w'
+
+    - name: "Repack iso"
+      block:
+        - name: "Extract isohdpfx.bin"
+          ansible.builtin.command: "dd if={{ base_iso }} bs=1 count=432 of=/tmp/isohdpfx.bin"
+
+        - name: "Repack iso"
+          ansible.builtin.command: |
+            xorriso \
+             -as mkisofs \
+             -r \
+             -V 'Custom' \
+             -o "./custom.iso" \
+             -J \
+             -J \
+             -joliet-long \
+             -cache-inodes \
+             -isohybrid-mbr "/tmp/isohdpfx.bin" \
+             -b isolinux/isolinux.bin \
+             -c isolinux/boot.cat \
+             -boot-load-size 4 \
+             -boot-info-table \
+             -no-emul-boot \
+             -eltorito-alt-boot \
+             -e boot/grub/efi.img \
+             -no-emul-boot \
+             -isohybrid-gpt-basdat \
+             -isohybrid-apm-hfsplus \
+             {{ tmpdir.path }}
+
+    - name: "Cleanup temp dir"
+      become: true
+      ansible.builtin.file:
+        path: "{{ tmpdir.path }}"
+        state: absent
