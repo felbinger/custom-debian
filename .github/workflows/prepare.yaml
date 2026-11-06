@@ -1,0 +1,119 @@
+name: Prepare ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 1024
+          swap-size-mb: 512
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Install required packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools xorriso wget
+
+      - name: Download base iso
+        run: wget https://cdimage.debian.org/debian-cd/current/amd64/iso-dvd/debian-13.7.0-amd64-DVD-1.iso
+
+      - name: Extract iso image
+        run: |
+          echo tmp=$(mktemp -d) >> ${GITHUB_ENV}
+          bsdtar -C ${tmp} -xf ./debian-13.7.0-amd64-DVD-1.iso
+
+      - name: Add preseed.cfg
+        working-directory: ${{ env.tmp }}
+        run: |
+          mkdir -p ./custom
+          cat <<_EOF > ./custom/preseed.cfg
+          d-i netcfg/choose_interface select auto
+          d-i time/zone string Europe/Berlin
+          d-i netcfg/get_hostname string unassigned-hostname
+          d-i netcfg/get_domain string unassigned-domain
+          d-i passwd/make-user boolean false
+          d-i passwd/root-password password s3cr3t
+          d-i passwd/root-password-again password s3cr3t
+          _EOF
+
+      - name: Adjust legacy/csm boot menu
+        working-directory: ${{ env.tmp }}
+        run: |
+          chmod +w ${tmp}/isolinux/
+
+          cat <<_EOF | tee ${tmp}/isolinux/custom.cfg &>/dev/null
+          default custom
+          label custom
+            menu label Custom Install
+            menu default
+            kernel /install.amd/vmlinuz
+            append vga=788 initrd=/install.amd/gtk/initrd.gz language=en country=DE locale=en_US.UTF-8 keymap=de net.ifnames=0 auto preseed/file=/cdrom/custom/preseed.cfg --- quiet
+          _EOF
+
+          sed -i '/include menu.cfg/i include custom.cfg' ${tmp}/isolinux/isolinux.cfg
+
+          # remove old default
+          sed -i 's/\tmenu default//' ${tmp}/isolinux/gtk.cfg
+
+          # remove speed synthesis
+          sed -i -e '/timeout/,+3d' ${tmp}/isolinux/spkgtk.cfg
+
+          chmod -w ${tmp}/isolinux/
+
+      - name: Adjust efi boot menu
+        working-directory: ${{ env.tmp }}
+        run: |
+          chmod +w ${tmp}/boot/grub
+
+          sed -i '/^set theme=\/boot\/grub\/theme\/1$/a\
+          menuentry "Custom Install" {\
+              set background_color=black\
+              linux    /install.amd/vmlinuz vga=788 language=en country=DE locale=en_US.UTF-8 keymap=de net.ifnames=0 auto preseed/file=/cdrom/custom/preseed.cfg --- quiet\
+              initrd   /install.amd/gtk/initrd.gz\
+          }' ${tmp}/boot/grub/grub.cfg
+
+          chmod -w ${tmp}/boot/grub
+
+      - name: Regenerate hashes
+        working-directory: ${{ env.tmp }}
+        run: |
+          chmod +w md5sum.txt
+          find -follow -type f ! -name md5sum.txt -print0 2> /dev/null | xargs -0 md5sum > md5sum.txt
+          chmod -w md5sum.txt
+
+      - name: Repack iso
+        run: |
+          dd if=debian-13.7.0-amd64-DVD-1.iso bs=1 count=432 of=/tmp/isohdpfx.bin
+          xorriso -as mkisofs \
+           -r -V 'Custom' \
+           -o ./custom.iso \
+           -J \
+           -J \
+           -joliet-long \
+           -cache-inodes \
+           -isohybrid-mbr /tmp/isohdpfx.bin \
+           -b isolinux/isolinux.bin \
+           -c isolinux/boot.cat \
+           -boot-load-size 4 \
+           -boot-info-table \
+           -no-emul-boot \
+           -eltorito-alt-boot \
+           -e boot/grub/efi.img \
+           -no-emul-boot \
+           -isohybrid-gpt-basdat \
+           -isohybrid-apm-hfsplus \
+           ${tmp}
+
+      - name: Upload iso image
+        uses: actions/upload-artifact@v7
+        with:
+          name: custom.iso
+          path: custom.iso
